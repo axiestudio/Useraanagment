@@ -1,16 +1,18 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts';
 import { createClient } from 'npm:@supabase/supabase-js@2.49.1';
 
-// Validate required environment variables
-const SUPABASE_URL = Deno.env.get('SUPABASE_URL');
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY');
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+);
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !SUPABASE_ANON_KEY) {
-  throw new Error('Missing required environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY');
+const AXIESTUDIO_APP_URL = Deno.env.get('AXIESTUDIO_APP_URL')!;
+const AXIESTUDIO_USERNAME = Deno.env.get('AXIESTUDIO_USERNAME')!;
+const AXIESTUDIO_PASSWORD = Deno.env.get('AXIESTUDIO_PASSWORD')!;
+
+if (!AXIESTUDIO_APP_URL || !AXIESTUDIO_USERNAME || !AXIESTUDIO_PASSWORD) {
+  throw new Error('Missing required Axie Studio environment variables');
 }
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -18,19 +20,10 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
-// 🚨 LEGAL COMPLIANCE: Complete AxieStudio account deletion for manual deletion
-async function deactivateAxieStudioUserOnDeletion(email: string): Promise<void> {
+async function getAxieStudioApiKey(): Promise<string> {
   try {
-    const AXIESTUDIO_APP_URL = Deno.env.get('AXIESTUDIO_APP_URL');
-    const AXIESTUDIO_USERNAME = Deno.env.get('AXIESTUDIO_USERNAME');
-    const AXIESTUDIO_PASSWORD = Deno.env.get('AXIESTUDIO_PASSWORD');
-
-    if (!AXIESTUDIO_APP_URL || !AXIESTUDIO_USERNAME || !AXIESTUDIO_PASSWORD) {
-      throw new Error('Missing AxieStudio environment variables');
-    }
-
-    // Step 1: Login to get API key
-    const loginResponse = await fetch(`${AXIESTUDIO_APP_URL}/api/v1/login/`, {
+    // Step 1: Login to get JWT token
+    const loginResponse = await fetch(`${AXIESTUDIO_APP_URL}/api/v1/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -40,20 +33,21 @@ async function deactivateAxieStudioUserOnDeletion(email: string): Promise<void> 
     });
 
     if (!loginResponse.ok) {
-      throw new Error(`AxieStudio login failed: ${loginResponse.status}`);
+      throw new Error(`Login failed: ${loginResponse.status}`);
     }
 
-    const loginData = await loginResponse.json();
-    const accessToken = loginData.access_token;
+    const { access_token } = await loginResponse.json();
 
-    // Step 2: Create API key
+    // Step 2: Create API key using JWT token
     const apiKeyResponse = await fetch(`${AXIESTUDIO_APP_URL}/api/v1/api_key/`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${accessToken}`,
+        'Authorization': `Bearer ${access_token}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ name: `deactivation-${Date.now()}` })
+      body: JSON.stringify({
+        name: 'Trial Cleanup API Key'
+      })
     });
 
     if (!apiKeyResponse.ok) {
@@ -61,390 +55,223 @@ async function deactivateAxieStudioUserOnDeletion(email: string): Promise<void> 
     }
 
     const { api_key } = await apiKeyResponse.json();
+    return api_key;
+  } catch (error) {
+    console.error('Failed to get Axie Studio API key:', error);
+    throw error;
+  }
+}
 
-    // Step 3: Find and deactivate user
-    const usersResponse = await fetch(`${AXIESTUDIO_APP_URL}/api/v1/users/?x-api-key=${api_key}`);
+// 🚨 CRITICAL FIX: Deactivate AxieStudio accounts instead of deleting them
+// This preserves user data for potential reactivation when they resubscribe
+async function deactivateAxieStudioUser(email: string): Promise<void> {
+  try {
+    const apiKey = await getAxieStudioApiKey();
+
+    // Find user by email
+    const usersResponse = await fetch(`${AXIESTUDIO_APP_URL}/api/v1/users/?x-api-key=${apiKey}`);
 
     if (!usersResponse.ok) {
       throw new Error(`Failed to fetch users: ${usersResponse.status}`);
     }
 
     const usersData = await usersResponse.json();
+
+    // Handle the proper API response structure: { total_count: number, users: array }
     const usersList = usersData.users || usersData;
     const user = usersList.find((u: any) => u.username === email);
+
+    console.log(`Found ${usersData.total_count || usersList.length} users in AxieStudio during cleanup`);
+    console.log(`Looking for user to deactivate: ${email}`);
 
     if (!user) {
       console.log(`User ${email} not found in Axie Studio, skipping deactivation`);
       return;
     }
 
-    // 🚨 CRITICAL FIX: DEACTIVATE instead of DELETE to preserve data
-    console.log(`🔄 Setting AxieStudio account to ACTIVE = FALSE for user: ${email}`);
-    
-    const deactivateResponse = await fetch(`${AXIESTUDIO_APP_URL}/api/v1/users/${user.id}?x-api-key=${api_key}`, {
+    // 🚨 CRITICAL FIX: Deactivate instead of delete to preserve user data
+    const deactivateResponse = await fetch(`${AXIESTUDIO_APP_URL}/api/v1/users/${user.id}?x-api-key=${apiKey}`, {
       method: 'PATCH',
       headers: {
-        'x-api-key': api_key,
+        'x-api-key': apiKey,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        is_active: false  // 🚨 CRITICAL: Set ACTIVE = FALSE instead of deleting
+        is_active: false  // Deactivate account - preserves data, requires admin approval to reactivate
       })
     });
 
     if (!deactivateResponse.ok) {
-      const errorText = await deactivateResponse.text();
-      throw new Error(`Failed to deactivate AxieStudio user: ${deactivateResponse.status} - ${errorText}`);
+      throw new Error(`Failed to deactivate Axie Studio user: ${deactivateResponse.status}`);
     }
 
-    console.log(`✅ AxieStudio user DEACTIVATED (ACTIVE = FALSE): ${email}`);
-    console.log(`📋 User data preserved but account requires admin approval to reactivate`);
+    console.log(`✅ Axie Studio user DEACTIVATED (data preserved): ${email}`);
   } catch (error) {
-    console.error(`❌ Failed to deactivate AxieStudio user ${email}:`, error);
+    console.error('Error deactivating Axie Studio user:', error);
     throw error;
   }
 }
 
+// Legacy function name for backward compatibility
+async function deleteAxieStudioUser(email: string): Promise<void> {
+  console.log(`⚠️ LEGACY CALL: deleteAxieStudioUser now deactivates instead of deleting`);
+  await deactivateAxieStudioUser(email);
+}
+
 Deno.serve(async (req) => {
-  // Handle CORS preflight requests
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
-
   try {
-    // SECURITY: Verify the user is authenticated and can only delete their own account
-    const authHeader = req.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (req.method === 'OPTIONS') {
+      return new Response(null, { status: 200, headers: corsHeaders });
+    }
+
+    if (req.method !== 'POST') {
       return new Response(
-        JSON.stringify({ error: 'Authorization header required' }),
-        {
-          status: 401,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
+        JSON.stringify({ error: 'Method not allowed' }),
+        { status: 405, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    const token = authHeader.replace('Bearer ', '');
+    // This function should be called by a cron job or scheduled task
+    console.log('Starting trial cleanup process...');
 
-    // Create a client with the user's token to verify authentication
-    const userSupabase = createClient(
-      SUPABASE_URL,
-      SUPABASE_ANON_KEY,
-      {
-        global: {
-          headers: {
-            Authorization: authHeader,
-          },
-        },
-      }
-    );
-
-    // Verify the user is authenticated
-    const { data: { user: authenticatedUser }, error: authError } = await userSupabase.auth.getUser(token);
-
-    if (authError || !authenticatedUser) {
-      return new Response(
-        JSON.stringify({ error: 'Invalid or expired token' }),
-        {
-          status: 401,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
-      );
+    // Step 1: Protect paying customers first (CRITICAL SAFETY STEP)
+    const { error: protectError } = await supabase.rpc('protect_paying_customers');
+    
+    if (protectError) {
+      console.error('Error protecting paying customers:', protectError);
+      throw new Error('Failed to protect paying customers');
+    }
+    
+    // Step 2: Sync subscription status
+    const { error: syncError } = await supabase.rpc('sync_subscription_status');
+    
+    if (syncError) {
+      console.error('Error syncing subscription status:', syncError);
+      throw new Error('Failed to sync subscription status');
+    }
+    
+    // Step 3: Check for expired trials and schedule deletions
+    const { error: checkError } = await supabase.rpc('check_expired_trials');
+    
+    if (checkError) {
+      console.error('Error checking expired trials:', checkError);
+      throw new Error('Failed to check expired trials');
     }
 
-    const { user_id } = await req.json();
-
-    // SECURITY: Ensure user can only delete their own account
-    if (user_id !== authenticatedUser.id) {
-      return new Response(
-        JSON.stringify({ error: 'You can only delete your own account' }),
-        {
-          status: 403,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
-      );
+    // Step 4: Get users scheduled for deletion (with safety checks)
+    const { data: usersToDelete, error: getUsersError } = await supabase.rpc('get_users_for_deletion');
+    
+    if (getUsersError) {
+      console.error('Error getting users for deletion:', getUsersError);
+      throw new Error('Failed to get users for deletion');
     }
 
-    if (!user_id) {
-      return new Response(
-        JSON.stringify({ error: 'User ID is required' }),
-        {
-          status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
-      );
-    }
+    console.log(`Found ${usersToDelete?.length || 0} users scheduled for deletion`);
 
-    // SECURITY: Prevent deletion of super admin account
+    // Step 5: Final safety check before deletion
+    const safeUsersToDelete = [];
     const SUPER_ADMIN_ID = 'b8782453-a343-4301-a947-67c5bb407d2b';
-    if (user_id === SUPER_ADMIN_ID) {
-      return new Response(
-        JSON.stringify({ error: 'Super admin account cannot be deleted' }),
-        {
-          status: 403,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
-      );
-    }
 
-    console.log(`🗑️ Starting immediate deletion for user: ${user_id}`);
+    for (const userToDelete of usersToDelete || []) {
+      // CRITICAL SAFETY CHECK: NEVER delete super admin account
+      if (userToDelete.user_id === SUPER_ADMIN_ID) {
+        console.log(`CRITICAL SAFETY: Skipping deletion of SUPER ADMIN ${userToDelete.email} - PROTECTED ACCOUNT`);
+        continue;
+      }
 
-    // STEP 1: Record deletion history FIRST (critical for abuse prevention)
-    let userEmail: string | null = null;
-    let trialUsed: boolean = false;
-    let trialCompleted: boolean = false;
-    try {
-      console.log('🔄 Recording deletion history (FIRST - critical for abuse prevention)...');
-
-      // Get user email first
-      const { data: userData } = await supabase.auth.admin.getUserById(user_id);
-      userEmail = userData?.user?.email || null;
-
-      // Get trial information to track usage
-      const { data: trialData } = await supabase
-        .from('user_trials')
-        .select('trial_status, trial_start_date, trial_end_date')
-        .eq('user_id', user_id)
+      // Double-check that user doesn't have active subscription
+      const { data: subscriptionCheck } = await supabase
+        .from('stripe_user_subscriptions')
+        .select('subscription_status')
+        .eq('customer_id', userToDelete.user_id)
         .single();
 
-      if (trialData) {
-        trialUsed = true; // User had a trial
-        // Check if they used the full 7 days or converted to paid
-        trialCompleted = trialData.trial_status === 'expired' || 
-                        trialData.trial_status === 'converted_to_paid' ||
-                        new Date(trialData.trial_end_date) <= new Date();
-      }
-
-      if (userEmail) {
-        await supabase.rpc('record_account_deletion', {
-          p_user_id: user_id,
-          p_email: userEmail,
-          p_reason: 'immediate_deletion',
-          p_trial_used: trialUsed,
-          p_trial_completed: trialCompleted
-        });
-        console.log('✅ Deletion history recorded - abuse prevention secured');
+      if (!subscriptionCheck || !['active', 'trialing'].includes(subscriptionCheck.subscription_status)) {
+        safeUsersToDelete.push(userToDelete);
       } else {
-        throw new Error('Could not retrieve user email for deletion history');
+        console.log(`SAFETY: Skipping deletion of ${userToDelete.email} - has active subscription`);
       }
-    } catch (error) {
-      console.error('❌ CRITICAL: Failed to record deletion history:', error);
-      return new Response(
-        JSON.stringify({
-          error: 'Failed to record deletion history - operation aborted for security',
-          code: 'HISTORY_RECORD_FAILED'
-        }),
-        {
-          status: 500,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        }
-      );
     }
+    
+    // Step 6: Delete each verified expired user
+    const deletionResults = [];
+    
+    for (const userToDelete of safeUsersToDelete) {
+      try {
+        console.log(`Processing deletion for user: ${userToDelete.email}`);
 
-    // STEP 1.5: 🚨 LEGAL COMPLIANCE - Complete AxieStudio Account Deletion
-    try {
-      console.log('🔄 Deactivating AxieStudio account (ACTIVE = FALSE)...');
-
-      if (userEmail) {
-        await deactivateAxieStudioUserOnDeletion(userEmail);
-        console.log('✅ AxieStudio account deactivated (ACTIVE = FALSE)');
-      }
-    } catch (error) {
-      console.warn('⚠️ AxieStudio deactivation failed (non-critical):', error);
-      // Continue with deletion even if AxieStudio fails - user still has right to delete main account
-    }
-
-    // STEP 2: Comprehensive Stripe cleanup
-    try {
-      console.log('🔄 Starting comprehensive Stripe cleanup...');
-
-      // Get user's Stripe customer ID
-      const { data: customerData } = await supabase
-        .from('stripe_customers')
-        .select('customer_id')
-        .eq('user_id', user_id)
-        .single();
-
-      if (customerData?.customer_id) {
-        console.log(`🔄 Processing Stripe customer: ${customerData.customer_id}`);
-
-        // 1. Cancel all active subscriptions
-        const { data: subscriptions } = await supabase
-          .from('stripe_subscriptions')
-          .select('subscription_id, status')
-          .eq('customer_id', customerData.customer_id)
-          .in('status', ['active', 'trialing', 'past_due']);
-
-        if (subscriptions && subscriptions.length > 0) {
-          for (const sub of subscriptions) {
-            try {
-              // Mark as cancelled in our database immediately
-              await supabase
-                .from('stripe_subscriptions')
-                .update({
-                  status: 'canceled',
-                  cancel_at_period_end: true,
-                  canceled_at: Math.floor(Date.now() / 1000),
-                  deleted_at: new Date().toISOString(),
-                  updated_at: new Date().toISOString()
-                })
-                .eq('subscription_id', sub.subscription_id);
-
-              console.log(`✅ Cancelled subscription: ${sub.subscription_id}`);
-            } catch (subError) {
-              console.warn(`⚠️ Failed to cancel subscription ${sub.subscription_id}:`, subError);
-            }
-          }
-          console.log(`✅ Processed ${subscriptions.length} Stripe subscriptions`);
-        }
-
-        // 2. Mark customer as deleted in our database
-        await supabase
-          .from('stripe_customers')
-          .update({
-            deleted_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          })
-          .eq('customer_id', customerData.customer_id);
-
-        console.log('✅ Stripe customer marked as deleted');
-      } else {
-        console.log('ℹ️ No Stripe customer found for user');
-      }
-    } catch (error) {
-      console.warn('⚠️ Stripe cleanup failed (non-critical):', error);
-      // Don't fail the entire deletion for Stripe issues
-    }
-
-    // 2. Remove user access immediately
-    try {
-      console.log('🔄 Removing user access...');
-      
-      // Mark user for immediate deletion in user_account_state
-      await supabase
-        .from('user_account_state')
-        .update({
-          account_status: 'deleted',
-          has_access: false,
-          access_level: 'suspended',
-          trial_days_remaining: 0,
-          updated_at: new Date().toISOString()
-        })
-        .eq('user_id', user_id);
-
-      // Mark trial as deleted
-      await supabase
-        .from('user_trials')
-        .update({
-          trial_status: 'deleted',
-          deletion_scheduled_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        })
-        .eq('user_id', user_id);
-
-      console.log('✅ User access removed');
-    } catch (error) {
-      console.warn('⚠️ Access removal failed:', error);
-    }
-
-    // STEP 4: Delete user data from all tables in correct order
-    try {
-      console.log('🔄 Deleting user data...');
-
-      // Delete in correct order to respect foreign key constraints
-      const deletionSteps = [
-        { table: 'stripe_subscriptions', column: 'customer_id', isCustomerId: true },
-        { table: 'axie_studio_accounts', column: 'user_id', isCustomerId: false },
-        { table: 'axie_studio_credentials', column: 'user_id', isCustomerId: false },
-        { table: 'user_account_state', column: 'user_id', isCustomerId: false },
-        { table: 'stripe_customers', column: 'user_id', isCustomerId: false },
-        { table: 'user_trials', column: 'user_id', isCustomerId: false },
-        { table: 'user_profiles', column: 'id', isCustomerId: false }
-      ];
-
-      for (const step of deletionSteps) {
+        // 🚨 CRITICAL: DEACTIVATE AXIESTUDIO ACCOUNT WHEN TRIAL EXPIRES
         try {
-          if (step.isCustomerId) {
-            // For stripe_subscriptions, we need to delete by customer_id
-            const { data: customerData } = await supabase
-              .from('stripe_customers')
-              .select('customer_id')
-              .eq('user_id', user_id);
+          console.log(`🔄 Setting AxieStudio account ACTIVE = FALSE for expired trial: ${userToDelete.email}`);
 
-            if (customerData && customerData.length > 0) {
-              for (const customer of customerData) {
-                await supabase
-                  .from(step.table)
-                  .delete()
-                  .eq(step.column, customer.customer_id);
-              }
+          // Call the lifecycle manager to deactivate AxieStudio account
+          const { error: axieError } = await supabase.functions.invoke('manage-axiestudio-lifecycle', {
+            body: {
+              action: 'deactivate_on_trial_end',
+              user_id: userToDelete.user_id,
+              reason: 'trial_expired'
             }
+          });
+
+      console.error('❌ CRITICAL: AxieStudio deactivation failed:', error);
+      // Still continue with main account deletion but log the failure
+      console.log('⚠️ Continuing with main account deletion despite AxieStudio deactivation failure');
+            console.error('❌ Failed to deactivate AxieStudio account:', axieError);
           } else {
-            await supabase
-              .from(step.table)
-              .delete()
-              .eq(step.column, user_id);
+            console.log('✅ AxieStudio account deactivated (active = false) for expired trial');
           }
-          console.log(`✅ Deleted data from ${step.table}`);
-        } catch (error) {
-          console.warn(`⚠️ Failed to delete from ${step.table}:`, error);
+        } catch (axieError) {
+          console.error('❌ Error deactivating AxieStudio account:', axieError);
         }
+
+        // 🚨 PRESERVE AXIESTUDIO DATA: Do not delete AxieStudio accounts
+        // Users can resubscribe and regain access to their existing AxieStudio data
+        console.log(`⚠️ AxieStudio account deactivated but data preserved for ${userToDelete.email}`);
+
+        // Only delete from Supabase auth (this will cascade to other tables)
+        const { error: deleteUserError } = await supabase.auth.admin.deleteUser(userToDelete.user_id);
+        
+        if (deleteUserError) {
+          console.error(`Failed to delete Supabase user ${userToDelete.email}:`, deleteUserError);
+          deletionResults.push({
+            email: userToDelete.email,
+            success: false,
+            error: deleteUserError.message
+          });
+        } else {
+          console.log(`Successfully deleted user: ${userToDelete.email}`);
+          deletionResults.push({
+            email: userToDelete.email,
+            success: true
+          });
+        }
+      } catch (error: any) {
+        console.error(`Failed to delete user ${userToDelete.email}:`, error);
+        deletionResults.push({
+          email: userToDelete.email,
+          success: false,
+          error: error.message
+        });
       }
-    } catch (error) {
-      console.warn('⚠️ Data deletion failed:', error);
     }
-
-    // 4. Delete the Supabase Auth user (this will cascade delete remaining data)
-    try {
-      console.log('🔄 Deleting Supabase Auth user...');
-      
-      const { error: deleteError } = await supabase.auth.admin.deleteUser(user_id);
-      
-      if (deleteError) {
-        console.error('❌ Auth user deletion failed:', deleteError);
-        throw deleteError;
-      }
-      
-      console.log('✅ Supabase Auth user deleted');
-    } catch (error) {
-      console.error('❌ Auth deletion failed:', error);
-      throw error;
-    }
-
-    console.log('✅ User deletion completed successfully');
-
-    return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: 'User account deleted successfully' 
-      }),
-      { 
-        status: 200, 
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-      }
-    );
-
-  } catch (error) {
-    console.error('❌ User deletion failed:', error);
-
-    // SECURITY: Sanitize error response - don't leak sensitive information
-    const sanitizedError = error instanceof Error
-      ? (error.message.includes('auth') || error.message.includes('token')
-         ? 'Authentication error occurred'
-         : 'Internal server error occurred')
-      : 'Unknown error occurred';
 
     return new Response(
       JSON.stringify({
-        error: 'Failed to delete user account',
-        code: 'DELETION_FAILED',
-        message: sanitizedError,
-        timestamp: new Date().toISOString()
+        success: true,
+        message: 'Trial cleanup completed',
+        total_candidates: usersToDelete?.length || 0,
+        protected_users: (usersToDelete?.length || 0) - safeUsersToDelete.length,
+        processed: safeUsersToDelete.length,
+        results: deletionResults
       }),
-      {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      }
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+
+  } catch (error: any) {
+    console.error('Trial cleanup error:', error);
+    return new Response(
+      JSON.stringify({ error: error.message || 'Internal server error' }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
 });
